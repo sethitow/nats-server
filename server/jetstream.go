@@ -15,6 +15,7 @@ package server
 
 import (
 	"bytes"
+	"context"
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/binary"
@@ -23,6 +24,7 @@ import (
 	"fmt"
 	"math"
 	"os"
+	"path"
 	"path/filepath"
 	"runtime/debug"
 	"strconv"
@@ -38,6 +40,15 @@ import (
 	"github.com/nats-io/nuid"
 )
 
+type ObjectStoreConfig struct {
+	Bucket          string `json:"bucket"`                      // S3 bucket name
+	Endpoint        string `json:"endpoint,omitempty"`          // S3 endpoint URL
+	AccessKeyID     string `json:"access_key_id,omitempty"`     // S3 access key
+	SecretAccessKey string `json:"secret_access_key,omitempty"` // S3 secret key
+	Region          string `json:"region,omitempty"`            // S3 region
+	PathPrefix      string `json:"path_prefix,omitempty"`       // Object key prefix
+}
+
 // JetStreamConfig determines this server's configuration.
 // MaxMemory and MaxStore are in bytes.
 type JetStreamConfig struct {
@@ -50,6 +61,8 @@ type JetStreamConfig struct {
 	CompressOK   bool          `json:"compress_ok,omitempty"`   // CompressOK indicates if compression is supported
 	UniqueTag    string        `json:"unique_tag,omitempty"`    // UniqueTag is the unique tag assigned to this instance
 	Strict       bool          `json:"strict,omitempty"`        // Strict indicates if strict JSON parsing is performed
+
+	ObjectStore ObjectStoreConfig `json:"object_store,omitempty"`
 }
 
 // Statistics about JetStream for this server.
@@ -561,6 +574,14 @@ func (s *Server) restartJetStream() error {
 		MaxStore:     opts.JetStreamMaxStore,
 		Domain:       opts.JetStreamDomain,
 		Strict:       !opts.NoJetStreamStrict,
+		ObjectStore: ObjectStoreConfig{
+			Bucket:          opts.JetStreamObjectStore.Bucket,
+			Endpoint:        opts.JetStreamObjectStore.Endpoint,
+			AccessKeyID:     opts.JetStreamObjectStore.AccessKeyID,
+			SecretAccessKey: opts.JetStreamObjectStore.SecretAccessKey,
+			Region:          opts.JetStreamObjectStore.Region,
+			PathPrefix:      opts.JetStreamObjectStore.PathPrefix,
+		},
 	}
 	s.Noticef("Restarting JetStream")
 	err := s.EnableJetStream(&cfg)
@@ -1269,7 +1290,111 @@ func (a *Account) EnableJetStream(limits map[string]JetStreamAccountLimits) erro
 	plaintext := true
 	sc := s.getOpts().JetStreamCipher
 
-	// Now recover the streams.
+	// if a bucket is configured recover object streams
+	objstorecfg := s.getOpts().JetStreamObjectStore
+	if objstorecfg.Bucket != _EMPTY_ {
+		objClient, err := newObjectStorageClient(ObjectStoreConfig{
+			Bucket:          objstorecfg.Bucket,
+			Endpoint:        objstorecfg.Endpoint,
+			AccessKeyID:     objstorecfg.AccessKeyID,
+			SecretAccessKey: objstorecfg.SecretAccessKey,
+			Region:          objstorecfg.Region,
+			PathPrefix:      path.Join(objstorecfg.PathPrefix, jsa.account.Name),
+		})
+		if err != nil {
+			return err
+		}
+
+		// recover the objstore assets
+		ctx, cancel := context.WithTimeout(context.Background(), defaultUploadTimeout)
+		defer cancel()
+		streamObjs, err := objClient.ListObjects(ctx, "")
+		if err != nil {
+			return err
+		}
+		for _, sObj := range streamObjs {
+			metaKey := path.Join(path.Base(sObj.Key), JetStreamMetaFile)
+			buf, err := objClient.GetObject(ctx, metaKey)
+			if err != nil {
+				s.Warnf("  Error reading metadata object %q: %v", metaKey, err)
+				continue
+			}
+
+			var cfg FileStreamInfo
+			if err := json.Unmarshal(buf, &cfg); err != nil {
+				s.Warnf("  Error unmarshalling stream metadata object %q: %v", metaKey, err)
+				continue
+			}
+
+			s.Noticef("  Starting restore for stream '%s > %s'", a.Name, cfg.StreamConfig.Name)
+			rt := time.Now()
+			// TODO: handle API versions
+			mset, err := a.addStream(&cfg.StreamConfig)
+			if err != nil {
+				s.Warnf("  Error recreating stream %q: %v", cfg.Name, err)
+				continue
+			}
+			s.Noticef("  Restored %s messages for stream '%s > %s' in %v",
+				comma(int64(mset.state().Msgs)), mset.accName(), mset.name(), time.Since(rt).Round(time.Millisecond))
+
+			// TODO: for filestore, why are the consumers recovered after all the streams?
+			// just do the objstore consumers inline for now
+			consumerKeyPrefix := path.Join(path.Base(sObj.Key), consumerKeyPrefix)
+			ctx, cancel = context.WithTimeout(context.Background(), defaultUploadTimeout)
+			defer cancel()
+			consumerObjs, err := objClient.ListObjects(ctx, consumerKeyPrefix)
+			if err != nil {
+				s.Warnf("  Error listing consumers for stream %q: %v", cfg.Name, err)
+			}
+			s.Noticef("  Recovering %d consumers for stream - '%s > %s'", len(consumerObjs), mset.accName(), mset.name())
+			for _, cObj := range consumerObjs {
+				cKeyName := path.Base(cObj.Key)
+				cMetaKey := path.Join(path.Base(sObj.Key), fmt.Sprintf(consumerMetaKeyPattern, cKeyName))
+				ctx, cancel = context.WithTimeout(context.Background(), defaultUploadTimeout)
+				defer cancel()
+				buf, err := objClient.GetObject(ctx, cMetaKey)
+				if err != nil {
+					s.Warnf("  Error downloading consumer metadata object %q: %v", cMetaKey, err)
+					continue
+				}
+
+				var cfg FileConsumerInfo
+				decoder := json.NewDecoder(bytes.NewReader(buf))
+				decoder.DisallowUnknownFields()
+				strictErr := decoder.Decode(&cfg)
+				if strictErr != nil {
+					cfg = FileConsumerInfo{}
+					if err := json.Unmarshal(buf, &cfg); err != nil {
+						s.Warnf("    Error unmarshalling consumer meta %q: %v", cMetaKey, err)
+						continue
+					}
+				}
+				// TODO: handle API versions
+				isEphemeral := !isDurableConsumer(&cfg.ConsumerConfig)
+				if isEphemeral {
+					// This is an ephemeral consumer and this could fail on restart until
+					// the consumer can reconnect. We will create it as a durable and switch it.
+					cfg.ConsumerConfig.Durable = cKeyName
+				}
+				obs, err := mset.addConsumerWithAssignment(&cfg.ConsumerConfig, _EMPTY_, nil, true, ActionCreateOrUpdate, false)
+				if err != nil {
+					s.Warnf("    Error adding consumer %q: %v", cfg.Name, err)
+					continue
+				}
+				if isEphemeral {
+					obs.switchToEphemeral()
+				}
+				if !cfg.Created.IsZero() {
+					obs.setCreatedTime(cfg.Created)
+				}
+				if err != nil {
+					s.Warnf("    Error restoring consumer %q state: %v", cfg.Name, err)
+				}
+			}
+		}
+	}
+
+	// Now recover the filestore streams.
 	fis, _ := os.ReadDir(sdir)
 	for _, fi := range fis {
 		mdir := filepath.Join(sdir, fi.Name())
@@ -2746,6 +2871,15 @@ func (s *Server) dynJetStreamConfig(storeDir string, maxStore, maxMem int64) *Je
 		} else {
 			jsc.MaxMemory = JetStreamMaxMemDefault
 		}
+	}
+
+	jsc.ObjectStore = ObjectStoreConfig{
+		Bucket:          opts.JetStreamObjectStore.Bucket,
+		Endpoint:        opts.JetStreamObjectStore.Endpoint,
+		AccessKeyID:     opts.JetStreamObjectStore.AccessKeyID,
+		SecretAccessKey: opts.JetStreamObjectStore.SecretAccessKey,
+		Region:          opts.JetStreamObjectStore.Region,
+		PathPrefix:      opts.JetStreamObjectStore.PathPrefix,
 	}
 
 	return jsc

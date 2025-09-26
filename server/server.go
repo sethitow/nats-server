@@ -2425,6 +2425,14 @@ func (s *Server) Start() {
 			Domain:       opts.JetStreamDomain,
 			CompressOK:   true,
 			UniqueTag:    opts.JetStreamUniqueTag,
+			ObjectStore: ObjectStoreConfig{
+				Bucket:          opts.JetStreamObjectStore.Bucket,
+				Endpoint:        opts.JetStreamObjectStore.Endpoint,
+				AccessKeyID:     opts.JetStreamObjectStore.AccessKeyID,
+				SecretAccessKey: opts.JetStreamObjectStore.SecretAccessKey,
+				Region:          opts.JetStreamObjectStore.Region,
+				PathPrefix:      opts.JetStreamObjectStore.PathPrefix,
+			},
 		}
 		if err := s.EnableJetStream(cfg); err != nil {
 			s.Fatalf("Can't start JetStream: %v", err)

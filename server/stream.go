@@ -24,6 +24,7 @@ import (
 	"math/big"
 	"math/rand"
 	"os"
+	"path"
 	"path/filepath"
 	"reflect"
 	"slices"
@@ -1671,7 +1672,7 @@ func (s *Server) checkStreamCfg(config *StreamConfig, acc *Account, pedantic boo
 	}
 
 	if cfg.PersistMode == AsyncPersistMode {
-		if cfg.Storage != FileStorage {
+		if cfg.Storage != FileStorage && cfg.Storage != ObjectStorage {
 			return StreamConfig{}, NewJSStreamInvalidConfigError(fmt.Errorf("async persist mode is only supported on file storage"))
 		}
 		if cfg.Replicas > 1 {
@@ -4560,6 +4561,31 @@ func (mset *stream) setupStore(fsCfg *FileStoreConfig) error {
 			return err
 		}
 		mset.store = fs
+	case ObjectStorage:
+		s := mset.srv
+		jsConfig := s.JetStreamConfig()
+		storeCfg := jsConfig.ObjectStore
+		if storeCfg.Bucket == "" {
+			return ErrObjectStoreNotConfigured
+		}
+
+		oscfg := ObjectStreamConfig{
+			ObjectStoreConfig: ObjectStoreConfig{
+				Bucket:          storeCfg.Bucket,
+				Endpoint:        storeCfg.Endpoint,
+				AccessKeyID:     storeCfg.AccessKeyID,
+				SecretAccessKey: storeCfg.SecretAccessKey,
+				Region:          storeCfg.Region,
+				PathPrefix:      path.Join(storeCfg.PathPrefix, mset.acc.Name, mset.nameLocked(false)),
+			},
+			srv: s,
+		}
+		os, err := newObjectStore(mset.cfg, oscfg)
+		if err != nil {
+			mset.mu.Unlock()
+			return err
+		}
+		mset.store = os
 	}
 	// This will fire the callback but we do not require the lock since md will be 0 here.
 	mset.store.RegisterStorageUpdates(mset.storeUpdates)

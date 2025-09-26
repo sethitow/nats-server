@@ -294,6 +294,15 @@ type JSLimitOpts struct {
 	MaxBatchTimeout           time.Duration `json:"max_batch_timeout,omitempty"`             // MaxBatchTimeout is the maximum time to receive the commit message after receiving the first message of a batch
 }
 
+type JSObjectStoreOpts struct {
+	Bucket          string `json:"bucket"`                      // S3 bucket name
+	Endpoint        string `json:"endpoint,omitempty"`          // S3 endpoint URL
+	AccessKeyID     string `json:"access_key_id,omitempty"`     // S3 access key
+	SecretAccessKey string `json:"secret_access_key,omitempty"` // S3 secret key
+	Region          string `json:"region,omitempty"`            // S3 region
+	PathPrefix      string `json:"path_prefix,omitempty"`       // Object key prefix
+}
+
 type JSTpmOpts struct {
 	KeysFile    string
 	KeyPassword string
@@ -380,6 +389,7 @@ type Options struct {
 	JetStreamCipher            StoreCipher   `json:"-"`
 	JetStreamUniqueTag         string
 	JetStreamLimits            JSLimitOpts
+	JetStreamObjectStore       JSObjectStoreOpts
 	JetStreamTpm               JSTpmOpts
 	JetStreamMaxCatchup        int64
 	JetStreamRequestQueueLimit int64
@@ -2603,6 +2613,10 @@ func parseJetStream(v any, opts *Options, errors *[]error, warnings *[]error) er
 					return &configErr{tk, fmt.Sprintf("Expected a parseable size for %q, got %v", mk, mv)}
 				}
 				opts.JetStreamRequestQueueLimit = lim
+			case "object_store":
+				if err := parseJetStreamObjectStore(tk, opts, errors); err != nil {
+					return err
+				}
 			default:
 				if !tk.IsUsedVariable() {
 					err := &unknownConfigFieldErr{
@@ -2621,6 +2635,48 @@ func parseJetStream(v any, opts *Options, errors *[]error, warnings *[]error) er
 		return &configErr{tk, fmt.Sprintf("Expected map, bool or string to define JetStream, got %T", v)}
 	}
 
+	return nil
+}
+
+func parseJetStreamObjectStore(v any, opts *Options, errors *[]error) error {
+	var lt token
+	tk, v := unwrapValue(v, &lt)
+
+	opts.JetStreamObjectStore = JSObjectStoreOpts{}
+
+	vv, ok := v.(map[string]any)
+	if !ok {
+		return &configErr{tk, fmt.Sprintf("Expected a map to define JetStream Object Store, got %T", v)}
+	}
+
+	for mk, mv := range vv {
+		tk, mv = unwrapValue(mv, &lt)
+		switch strings.ToLower(mk) {
+		case "bucket":
+			opts.JetStreamObjectStore.Bucket = mv.(string)
+		case "endpoint":
+			opts.JetStreamObjectStore.Endpoint = mv.(string)
+		case "access_key_id":
+			opts.JetStreamObjectStore.AccessKeyID = mv.(string)
+		case "secret_access_key":
+			opts.JetStreamObjectStore.SecretAccessKey = mv.(string)
+		case "region":
+			opts.JetStreamObjectStore.Region = mv.(string)
+		case "path_prefix":
+			opts.JetStreamObjectStore.PathPrefix = mv.(string)
+		default:
+			if !tk.IsUsedVariable() {
+				err := &unknownConfigFieldErr{
+					field: mk,
+					configErr: configErr{
+						token: tk,
+					},
+				}
+				*errors = append(*errors, err)
+				continue
+			}
+		}
+	}
 	return nil
 }
 
